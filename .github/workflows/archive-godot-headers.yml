@@ -1,0 +1,219 @@
+#
+# © 2026-present Godot Mobile Plugins (https://github.com/godot-mobile-plugins)
+#
+
+name: Archive Godot Headers
+
+on:
+  schedule:
+    - cron: '0 3 * * 3' # Every Wednesday at 03:00 UTC
+    - cron: '0 3 * * 0' # Every Sunday at 03:00 UTC
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >
+          Specific release tag to process (e.g. 4.6.2-rc2).
+          Leave empty to automatically check the latest 10 releases.
+        required: false
+        default: ''
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 1 – Determine which releases need header archives built
+  # ─────────────────────────────────────────────────────────────────────────────
+  check-releases:
+    name: Check for missing header releases
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    outputs:
+      # JSON array of tag strings that need to be built, e.g. ["4.6.2-rc2","4.5.2-stable"]
+      missing_tags: ${{ steps.check.outputs.missing_tags }}
+      # JSON array of all evaluated tags (used for the "all present" log message)
+      all_tags: ${{ steps.check.outputs.all_tags }}
+      # "true" when every evaluated tag already has a release in godot-headers
+      all_present: ${{ steps.check.outputs.all_present }}
+      # "single" when the workflow was dispatched with an explicit version,
+      # "batch"  when it ran on schedule / dispatch with no version input
+      mode: ${{ steps.check.outputs.mode }}
+
+    steps:
+      - name: Determine missing releases
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          MANUAL_VERSION="${{ inputs.version }}"
+
+          if [ -n "$MANUAL_VERSION" ]; then
+            # ── Manual dispatch with an explicit tag ──────────────────────────
+            echo "mode=single" >> "$GITHUB_OUTPUT"
+            ALL_TAGS_JSON=$(jq -cn --arg t "$MANUAL_VERSION" '[$t]')
+            echo "all_tags=$ALL_TAGS_JSON" >> "$GITHUB_OUTPUT"
+
+            if gh release view "$MANUAL_VERSION" \
+                 --repo godot-mobile-plugins/godot-headers \
+                 > /dev/null 2>&1; then
+              echo "Release '$MANUAL_VERSION' already exists in godot-mobile-plugins/godot-headers."
+              echo "missing_tags=[]"  >> "$GITHUB_OUTPUT"
+              echo "all_present=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Release '$MANUAL_VERSION' is missing – will build."
+              echo "missing_tags=$ALL_TAGS_JSON" >> "$GITHUB_OUTPUT"
+              echo "all_present=false"            >> "$GITHUB_OUTPUT"
+            fi
+
+          else
+            # ── Scheduled / unversioned dispatch – check latest 10 releases ──
+            echo "mode=batch" >> "$GITHUB_OUTPUT"
+
+            echo "Fetching the 10 latest releases from godotengine/godot-builds …"
+            GODOT_TAGS_JSON=$(gh release list \
+              --repo godotengine/godot-builds \
+              --limit 10 \
+              --json tagName \
+              --jq '[.[].tagName]')
+
+            echo "Latest 10 tags: $GODOT_TAGS_JSON"
+            echo "all_tags=$GODOT_TAGS_JSON" >> "$GITHUB_OUTPUT"
+
+            MISSING_JSON="[]"
+            ALL_PRESENT=true
+
+            while IFS= read -r TAG; do
+              echo "Checking '$TAG' in godot-mobile-plugins/godot-headers …"
+              if gh release view "$TAG" \
+                   --repo godot-mobile-plugins/godot-headers \
+                   > /dev/null 2>&1; then
+                echo "  ✔ present"
+              else
+                echo "  ✘ missing – will build"
+                ALL_PRESENT=false
+                MISSING_JSON=$(echo "$MISSING_JSON" | jq --arg t "$TAG" '. + [$t]')
+              fi
+            done < <(echo "$GODOT_TAGS_JSON" | jq -r '.[]')
+
+            echo "missing_tags=$MISSING_JSON" >> "$GITHUB_OUTPUT"
+
+            if $ALL_PRESENT; then
+              echo "all_present=true"  >> "$GITHUB_OUTPUT"
+            else
+              echo "all_present=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 2 – Log a summary when every checked release is already present
+  # ─────────────────────────────────────────────────────────────────────────────
+  log-all-present:
+    name: Log – all releases present
+    runs-on: ubuntu-latest
+    needs: check-releases
+    if: needs.check-releases.outputs.all_present == 'true'
+
+    steps:
+      - name: Print summary
+        env:
+          ALL_TAGS:  ${{ needs.check-releases.outputs.all_tags }}
+          MODE:      ${{ needs.check-releases.outputs.mode }}
+        run: |
+          if [ "$MODE" = "single" ]; then
+            TAG=$(echo "$ALL_TAGS" | jq -r '.[0]')
+            echo "Release '$TAG' is already present in godot-mobile-plugins/godot-headers. Nothing to do."
+          else
+            echo "All of the latest 10 releases from godotengine/godot-builds are already"
+            echo "present in godot-mobile-plugins/godot-headers."
+            echo ""
+            echo "Present tags:"
+            echo "$ALL_TAGS" | jq -r '.[] | "  - " + .'
+          fi
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 3 – Build a header archive for every missing release
+  #
+  # Each matrix entry is one tag (e.g. "4.6.2-rc2").  The tag is split into
+  # <version> (e.g. "4.6.2") and <flavor> (e.g. "rc2") before being passed to
+  # the ActionCommons/build-godot action.  max-parallel: 1 ensures releases are
+  # created one at a time to avoid race conditions.
+  # ─────────────────────────────────────────────────────────────────────────────
+  build-headers:
+    name: Build headers – ${{ matrix.tag }}
+    runs-on: macos-latest
+    needs: check-releases
+    if: >
+      needs.check-releases.outputs.all_present == 'false' &&
+      needs.check-releases.outputs.missing_tags != '[]'
+
+    permissions:
+      contents: write
+
+    strategy:
+      matrix:
+        tag: ${{ fromJson(needs.check-releases.outputs.missing_tags) }}
+      max-parallel: 1
+      fail-fast: false
+
+    steps:
+      # ── 1. Parse the tag into version + flavor ──────────────────────────────
+      #
+      # Tag format:  <semver>-<flavor>
+      # Examples:
+      #   4.6.2-rc2    → version=4.6.2   flavor=rc2
+      #   4.5.2-stable → version=4.5.2   flavor=stable
+      #   4.7-dev3     → version=4.7     flavor=dev3
+      #
+      - name: Parse version and flavor from tag
+        id: parse
+        shell: bash
+        run: |
+          TAG="${{ matrix.tag }}"
+
+          # Everything before the last hyphen is the version number.
+          VERSION="${TAG%-*}"
+          # Everything after the last hyphen is the flavor.
+          FLAVOR="${TAG##*-}"
+
+          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "flavor=$FLAVOR"   >> "$GITHUB_OUTPUT"
+
+          echo "Tag:     $TAG"
+          echo "Version: $VERSION"
+          echo "Flavor:  $FLAVOR"
+
+      # ── 2. Build the header archive ─────────────────────────────────────────
+      - name: Build Godot headers (${{ matrix.tag }})
+        id: godot
+        uses: ActionCommons/build-godot@v1
+        with:
+          version:      ${{ steps.parse.outputs.version }}
+          flavor:       ${{ steps.parse.outputs.flavor }}
+          platform:     ios
+          target:       template_debug
+          directory:    './custom_godot_source'
+          timeout:      '60'
+          options:      'create_header_archive'
+
+      # ── 3. Publish a matching release in godot-mobile-plugins/godot-headers ─
+      - name: Create release and upload header archive (${{ matrix.tag }})
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          TAG="${{ steps.parse.outputs.tag }}"
+          HEADER_ARCHIVE="${{ steps.godot.outputs.header_archive }}"
+
+          RELEASE_BODY="This release contains static and generated header files from an iOS build of the [$TAG](https://github.com/godotengine/godot-builds/releases/tag/$TAG) Godot Release"
+
+          echo "Creating release '$TAG' in godot-mobile-plugins/godot-headers …"
+          gh release create "$TAG" \
+            --repo  godot-mobile-plugins/godot-headers \
+            --title "$TAG" \
+            --notes "$RELEASE_BODY" \
+            "$HEADER_ARCHIVE"
+
+          echo "✔ Release '$TAG' created and header archive uploaded."
