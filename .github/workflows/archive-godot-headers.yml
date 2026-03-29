@@ -93,9 +93,52 @@ jobs:
               else
                 echo "  ✘ missing – will build"
                 ALL_PRESENT=false
-                MISSING_JSON=$(echo "$MISSING_JSON" | jq --arg t "$TAG" '. + [$t]')
+                MISSING_JSON=$(echo "$MISSING_JSON" | jq -c --arg t "$TAG" '. + [$t]')
               fi
             done < <(echo "$GODOT_TAGS_JSON" | jq -r '.[]')
+
+            # ── Sort missing tags: ascending version, then dev < beta < rc < stable ──
+            #
+            # Sort key format (all fields zero-padded so plain lexicographic sort works):
+            #   <MAJOR>.<MINOR>.<PATCH>.<FLAVOR_WEIGHT>.<FLAVOR_NUM>
+            #
+            #   FLAVOR_WEIGHT:  1=dev  2=beta  3=rc  4=stable  9=unknown
+            #
+            if [ "$MISSING_JSON" != "[]" ]; then
+              SORT_INPUT=""
+              while IFS= read -r TAG; do
+                VER="${TAG%-*}"
+                FLAVOR="${TAG##*-}"
+
+                IFS='.' read -r -a _V <<< "$VER"
+                MAJOR=$(printf '%04d' "${_V[0]:-0}")
+                MINOR=$(printf '%04d' "${_V[1]:-0}")
+                PATCH=$(printf '%04d' "${_V[2]:-0}")
+
+                if [[ "$FLAVOR" =~ ^dev([0-9]+)$ ]]; then
+                  W=1; N="${BASH_REMATCH[1]}"
+                elif [[ "$FLAVOR" =~ ^beta([0-9]+)$ ]]; then
+                  W=2; N="${BASH_REMATCH[1]}"
+                elif [[ "$FLAVOR" =~ ^rc([0-9]+)$ ]]; then
+                  W=3; N="${BASH_REMATCH[1]}"
+                elif [ "$FLAVOR" = "stable" ]; then
+                  W=4; N=0
+                else
+                  echo "::warning::Unrecognised flavor '$FLAVOR' in tag '$TAG' – it will be processed last."
+                  W=9; N=0
+                fi
+
+                KEY=$(printf '%s.%s.%s.%d.%04d' "$MAJOR" "$MINOR" "$PATCH" "$W" "$N")
+                SORT_INPUT+="${KEY} ${TAG}"$'\n'
+              done < <(echo "$MISSING_JSON" | jq -r '.[]')
+
+              MISSING_JSON=$(
+                printf '%s' "$SORT_INPUT" \
+                  | sort \
+                  | awk 'NF {print $2}' \
+                  | jq -Rcn '[inputs | select(length > 0)]'
+              )
+            fi
 
             echo "missing_tags=$MISSING_JSON" >> "$GITHUB_OUTPUT"
 
@@ -137,8 +180,21 @@ jobs:
   #
   # Each matrix entry is one tag (e.g. "4.6.2-rc2").  The tag is split into
   # <version> (e.g. "4.6.2") and <flavor> (e.g. "rc2") before being passed to
-  # the ActionCommons/build-godot action.  max-parallel: 1 ensures releases are
-  # created one at a time to avoid race conditions.
+  # the ActionCommons/build-godot action.
+  #
+  # Ordering guarantee: missing_tags is already sorted ascending by version and
+  # flavor (dev < beta < rc < stable) by check-releases.  GitHub Actions
+  # schedules matrix slots in array order when max-parallel: 1 is set, so
+  # releases are created in that sorted order, one at a time.
+  #
+  # Per-release steps:
+  #   1. Parse tag → version + flavor
+  #   2. Checkout godot-headers repository
+  #   3. Build the header archive via ActionCommons/build-godot
+  #   4. Rename the archive to godot-headers-<version>-<flavor>.zip
+  #   5. Count .h files and write releases/<version>-<flavor>.json
+  #   6. Commit the JSON, push it, and create the git tag on that commit
+  #   7. Create the GitHub release (against the existing tag) and attach the archive
   # ─────────────────────────────────────────────────────────────────────────────
   build-headers:
     name: Build headers – ${{ matrix.tag }}
@@ -185,7 +241,19 @@ jobs:
           echo "Version: $VERSION"
           echo "Flavor:  $FLAVOR"
 
-      # ── 2. Build the header archive ─────────────────────────────────────────
+      # ── 2. Checkout the godot-headers repository ────────────────────────────
+      #
+      # Checked out into ./godot-headers-repo to avoid colliding with the Godot
+      # source tree written to ./custom_godot_source by the build action.
+      # actions/checkout pre-configures origin with the GITHUB_TOKEN, so later
+      # git push commands work without extra credential setup.
+      #
+      - name: Checkout godot-headers repository
+        uses: actions/checkout@v6
+        with:
+          path: godot-headers-repo
+
+      # ── 3. Build the header archive ──────────────────────────────────────────
       - name: Build Godot headers (${{ matrix.tag }})
         id: godot
         uses: ActionCommons/build-godot@v1
@@ -193,19 +261,116 @@ jobs:
           version:      ${{ steps.parse.outputs.version }}
           flavor:       ${{ steps.parse.outputs.flavor }}
           platform:     ios
-          target:       template_debug
+          target:       template_release
           directory:    './custom_godot_source'
-          timeout:      '60'
+          timeout:      '120' # 2 minutes should be enough to generate all headers (GitHub environment can be slow)
           options:      'create_header_archive'
 
-      # ── 3. Publish a matching release in godot-mobile-plugins/godot-headers ─
+      # ── 4. Rename the header archive ────────────────────────────────────────
+      #
+      # Output file name format:  godot-headers-<version>-<flavor>.zip
+      # Examples:
+      #   godot-headers-4.6.2-rc2.zip
+      #   godot-headers-4.5.2-stable.zip
+      #   godot-headers-4.7-dev3.zip
+      #
+      - name: Rename header archive (${{ matrix.tag }})
+        id: rename
+        shell: bash
+        run: |
+          SRC="${{ steps.godot.outputs.header_archive }}"
+          DEST="godot-headers-${{ steps.parse.outputs.version }}-${{ steps.parse.outputs.flavor }}.zip"
+
+          mv "$SRC" "$DEST"
+          echo "header_archive=$DEST" >> "$GITHUB_OUTPUT"
+
+          echo "Renamed: $SRC → $DEST"
+
+      # ── 5. Generate the JSON description file ───────────────────────────────
+      #
+      # Counts every .h file inside the renamed archive using zipinfo (-Z1 lists
+      # one filename per line) and writes releases/<version>-<flavor>.json into
+      # the checked-out repository tree.
+      #
+      # JSON schema:
+      #   {
+      #     "version":          "<semver>",   e.g. "4.6.2"
+      #     "flavor":           "<flavor>",   e.g. "stable"
+      #     "num_header_files": <integer>
+      #   }
+      #
+      - name: Generate JSON description (${{ matrix.tag }})
+        id: json
+        shell: bash
+        run: |
+          VERSION="${{ steps.parse.outputs.version }}"
+          FLAVOR="${{ steps.parse.outputs.flavor }}"
+          HEADER_ARCHIVE="${{ steps.rename.outputs.header_archive }}"
+
+          NUM_HEADERS=$(unzip -Z1 "$HEADER_ARCHIVE" | grep -c '\.h$' || echo 0)
+
+          mkdir -p godot-headers-repo/releases
+          jq -n \
+            --arg  version "$VERSION" \
+            --arg  flavor  "$FLAVOR"  \
+            --argjson num  "$NUM_HEADERS" \
+            '{version: $version, flavor: $flavor, num_header_files: $num}' \
+            > "godot-headers-repo/releases/${VERSION}-${FLAVOR}.json"
+
+          echo "num_header_files=$NUM_HEADERS"               >> "$GITHUB_OUTPUT"
+          echo "json_path=releases/${VERSION}-${FLAVOR}.json" >> "$GITHUB_OUTPUT"
+          echo "Wrote godot-headers-repo/releases/${VERSION}-${FLAVOR}.json (num_header_files=$NUM_HEADERS)"
+
+      # ── 6. Commit the JSON file and push the release tag ────────────────────
+      #
+      # Each matrix job checks out the repo at step 2, but the build (step 3)
+      # takes ~60 minutes.  By the time this step runs, an earlier matrix job
+      # may have pushed new commits, leaving this clone behind.  The rebase pull
+      # brings the local branch up to date before committing, preventing the
+      # "fetch first" rejection seen on all jobs after the first.
+      #
+      # The JSON file written in step 5 sits outside the index at this point, so
+      # it is unaffected by the rebase.
+      #
+      # The git tag must be pushed before gh release create (step 7) is called;
+      # otherwise GitHub creates a dangling lightweight tag instead of attaching
+      # the release to the commit that contains the JSON file.
+      #
+      - name: Commit JSON description and tag (${{ matrix.tag }})
+        shell: bash
+        run: |
+          TAG="${{ steps.parse.outputs.tag }}"
+          VERSION="${{ steps.parse.outputs.version }}"
+          FLAVOR="${{ steps.parse.outputs.flavor }}"
+
+          cd godot-headers-repo
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git pull --rebase origin HEAD
+
+          git add "releases/${VERSION}-${FLAVOR}.json"
+          git commit -m "Add header description for ${TAG}"
+          git push origin HEAD
+          git tag "$TAG"
+          git push origin "$TAG"
+
+          echo "✔ Committed releases/${VERSION}-${FLAVOR}.json and pushed tag '$TAG'."
+
+      # ── 7. Create the GitHub release and attach the header archive ───────────
+      #
+      # The tag already exists on the repository (pushed in step 6), so
+      # gh release create attaches the release to that commit rather than
+      # creating a new dangling tag.
+      #
       - name: Create release and upload header archive (${{ matrix.tag }})
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           TAG="${{ steps.parse.outputs.tag }}"
-          HEADER_ARCHIVE="${{ steps.godot.outputs.header_archive }}"
+          HEADER_ARCHIVE="${{ steps.rename.outputs.header_archive }}"
 
           RELEASE_BODY="This release contains static and generated header files from an iOS build of the [$TAG](https://github.com/godotengine/godot-builds/releases/tag/$TAG) Godot Release"
 
